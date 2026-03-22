@@ -51,10 +51,22 @@ static void waitMicros(uint32_t target) {
 }
 
 static void releaseAllPins() { pinMode(chargePin, INPUT); pinMode(dischargePin, INPUT); }
-static void startCharge() { pinMode(dischargePin, INPUT); digitalWrite(chargePin, HIGH); pinMode(chargePin, OUTPUT); }
-static void stopCharge() { pinMode(chargePin, INPUT); }
-static void startDischarge() { pinMode(chargePin, INPUT); digitalWrite(dischargePin, LOW); pinMode(dischargePin, OUTPUT); }
-static void stopDischarge() { pinMode(dischargePin, INPUT); }
+static void startCharge() {
+    pinMode(dischargePin, INPUT);
+    digitalWrite(chargePin, HIGH);
+    pinMode(chargePin, OUTPUT);
+}
+static void stopCharge() {
+    pinMode(chargePin, INPUT);
+}
+static void startDischarge() {
+    pinMode(chargePin, INPUT);
+    digitalWrite(dischargePin, LOW);
+    pinMode(dischargePin, OUTPUT);
+}
+static void stopDischarge() {
+    pinMode(dischargePin, INPUT);
+}
 
 // Method 1: Exponential Fit
 struct FitResult { bool ok = false; float tau_us = NAN; float vinf = NAN; float score = INFINITY; };
@@ -98,7 +110,7 @@ static FitResult fitWithFixedVinf(const Sample *s, size_t n, float v0, float vin
         float v_pred = vinf - (vinf - v0) * expf(-(float)s[i].t_us / r.tau_us);
         rss += (s[i].v - v_pred) * (s[i].v - v_pred);
     }
-    r.score = (float)rss / used;
+    r.score = (float)rss / (float)n;
     return r;
 }
 
@@ -108,19 +120,18 @@ static FitResult fitExponential(const Sample *s, size_t n) {
 
     const float v0 = s[0].v;
     float v_last = s[n-1].v;
-    float vinf_min = fmaxf(v_last + 0.01f, v0 + 0.02f);
-    float vinf_max = fmaxf(V_SUPPLY_V * 1.15f, vinf_min + 0.1f);
+    float vinf_min = fmaxf(v_last + 0.005f, v0 + 0.01f);
+    float vinf_max = fmaxf(V_SUPPLY_V * 1.25f, vinf_min + 0.5f);
 
-    // Multi-pass search for Vinf to minimize RSS
     float current_min = vinf_min;
     float current_max = vinf_max;
 
-    for (int pass = 0; pass < 4; pass++) {
-        float step = (current_max - current_min) / 10.0f;
+    for (int pass = 0; pass < 5; pass++) {
+        float step = (current_max - current_min) / 30.0f;
         FitResult passBest;
         float bestVinf = current_min;
 
-        for (int i = 0; i <= 10; i++) {
+        for (int i = 0; i <= 30; i++) {
             float vinf_test = current_min + step * i;
             FitResult res = fitWithFixedVinf(s, n, v0, vinf_test);
             if (res.ok && res.score < passBest.score) {
@@ -128,29 +139,23 @@ static FitResult fitExponential(const Sample *s, size_t n) {
                 bestVinf = vinf_test;
             }
         }
-
         if (passBest.ok) {
             best = passBest;
-            // Golden-section inspired range narrowing
             current_min = fmaxf(vinf_min, bestVinf - step);
             current_max = fminf(vinf_max, bestVinf + step);
         } else break;
     }
 
-    // Final sanity checks on the model
     if (best.ok) {
         if (best.tau_us < 1.0f || best.tau_us > 100000000.0f) best.ok = false;
-        // score is RSS / used points. RMSE is sqrt(score).
-        // Standardize: fit is questionable if RMSE > 50mV
         if (sqrtf(best.score) > 0.050f) best.ok = false;
     }
-
     return best;
 }
 
 // Method 2: Leakage via Voltage Decay (Self-Discharge)
 static float estimateLeakResistance(float cap_uF) {
-    if (cap_uF < 0.001f) return 1e12f; // Too small to measure decay accurately
+    if (cap_uF < 0.001f) return 1e12f;
 
     startCharge();
     uint32_t deadline = millis() + 5000;
@@ -164,10 +169,7 @@ static float estimateLeakResistance(float cap_uF) {
 
     float v1 = readVoltage(16);
     uint32_t t1 = micros();
-
-    // Adaptive window: longer for smaller capacitors or higher expected resistance
-    uint32_t duration_ms = 1000;
-    if (cap_uF > 1000.0f) duration_ms = 2000;
+    uint32_t duration_ms = (cap_uF > 1000.0f) ? 2000 : 1000;
 
     deadline = millis() + duration_ms;
     while(millis() < deadline) { yield(); }
@@ -175,7 +177,6 @@ static float estimateLeakResistance(float cap_uF) {
     float v2 = readVoltage(16);
     uint32_t t2 = micros();
 
-    // If drop is too small, double the window for better resolution
     if (v1 - v2 < 0.05f && duration_ms < 5000) {
         deadline = millis() + duration_ms;
         while(millis() < deadline) { yield(); }
@@ -196,45 +197,49 @@ static float measureCapOscillator(float leak) {
     float vSteady = V_SUPPLY_V * leak / (R_CHARGE_OHMS + R_GPIO + leak);
     if (vSteady < vH * 1.05f) return NAN;
 
-    // Phase 1: Pre-condition - charge above vL
-    uint32_t deadline = millis() + 5000;
+    // Pre-condition
     startCharge();
-    while(readVoltage() < vL * 1.1f) {
-        if (millis() > deadline) return NAN;
+    uint32_t deadline = millis() + 5000;
+    while(readVoltage(2) < vH) {
+        if (millis() > deadline) { stopCharge(); return NAN; }
         yield();
     }
     stopCharge();
 
-    // Phase 2: Establish known state at vL with discharge
-    deadline = millis() + 5000;
+    // Stabilization cycles
     startDischarge();
-    while(readVoltage() > vL) {
-        if (millis() > deadline) return NAN;
-        yield();
+    deadline = millis() + 5000;
+    for(int i=0; i<3; i++) {
+        while(readVoltage(1) > vL) { if(millis() > deadline) break; }
+        stopDischarge(); startCharge();
+        while(readVoltage(1) < vH) { if(millis() > deadline) break; }
+        stopCharge(); startDischarge();
     }
+    while(readVoltage(1) > vL) { if(millis() > deadline) break; }
     stopDischarge();
 
     uint32_t tAccumUs = 0;
     const int cycles = 10;
     for(int i=0; i < cycles; i++) {
-        uint32_t tCycleStart = micros();
-        deadline = millis() + 10000;
+        uint32_t t1 = micros();
         startCharge();
-        while(readVoltage() < vH) {
-            if (millis() > deadline) return NAN;
-            yield();
-        }
+        // Use minimal oversampling for speed in threshold detection
+        while(readVoltage(1) < vH) { yield(); }
         stopCharge();
-        deadline = millis() + 10000;
+
         startDischarge();
-        while(readVoltage() > vL) {
-            if (millis() > deadline) return NAN;
-            yield();
-        }
+        while(readVoltage(1) > vL) { yield(); }
         stopDischarge();
-        tAccumUs += (micros() - tCycleStart);
+        tAccumUs += (micros() - t1);
+
+        if (tAccumUs > 20000000) return NAN; // Safety timeout
     }
+
     float tCycle = (float)tAccumUs / (float)cycles;
+    // Compensation for ADC latency and switching (~20-40us per cycle)
+    tCycle -= 30.0f;
+    if (tCycle < 10.0f) return NAN;
+
     float a = (vSteady - vL) / (vSteady - vH), b = vH / vL;
     if (a <= 0.0f || b <= 0.0f) return NAN;
     float tcN = logf(a), tdN = logf(b);
@@ -303,78 +308,64 @@ void loop() {
     size_t n = 0;
     startDischarge(); delay(1500); stopDischarge();
 
-    float v0_baseline = readVoltage();
-
-    startCharge();
     uint32_t t0 = micros();
-
-    // Capture first point immediately with low oversampling to catch fast transients
+    startCharge();
     float vStart = readVoltage(2);
-    samples_buf[n++] = { (uint32_t)(micros() - t0), vStart };
+    uint32_t tReadDone = micros();
+    samples_buf[n++] = { (uint32_t)((tReadDone - t0) / 2), vStart };
 
     uint32_t baseInterval = 5;
-    if (readVoltage(2) < 0.01 * V_SUPPLY_V) baseInterval = 1000;
+    if (readVoltage(2) < 0.01f * V_SUPPLY_V) baseInterval = 1000;
 
     while (n < MAX_SAMPLES) {
-        // Dynamic oversampling: 2x early on, 16x near plateau
         uint8_t os = (n < 50) ? 2 : (n < 200 ? 8 : 16);
         float vSample = readVoltage(os);
         samples_buf[n++] = { (uint32_t)(micros() - t0), vSample };
-        // Charge until very close to asymptote to ensure good Vinf estimation
         if (samples_buf[n-1].v >= V_SUPPLY_V * 0.99f || samples_buf[n-1].t_us > 15000000) break;
-
-        // Balanced sampling strategy: high density early, sufficient density late
         uint32_t interval = baseInterval + (uint32_t)(n * 0.5f * (float)baseInterval);
         if (n > 200) interval += (uint32_t)((n - 200) * 5.0f * (float)baseInterval);
-
-        uint32_t target = micros() + interval;
-        waitMicros(target);
+        waitMicros(micros() + interval);
         yield();
     }
     stopCharge();
 
     FitResult fr = fitExponential(samples_buf, n);
-
     float leak = NAN;
     float capFit = NAN, capOsc = NAN, capGain = NAN;
 
     if (fr.ok) {
-        // Multi-pass refinement of C and Leak
-        capFit = fr.tau_us / (R_CHARGE_OHMS + R_GPIO); // 1st pass: assume no leak
-        for(int i=0; i<2; i++) {
-            float leak_candidate = estimateLeakResistance(capFit);
-            // Self-check leak: if it's too low to be plausible for a "good" cap,
-            // it might be a measurement error.
-            if (isfinite(leak_candidate) && leak_candidate > 10.0f) {
-                leak = leak_candidate;
-            } else {
-                leak = 1e12f; break;
-            }
-            capFit = (fr.tau_us * (R_CHARGE_OHMS + R_GPIO + leak)) / ((R_CHARGE_OHMS + R_GPIO) * leak);
+        float c_current = fr.tau_us / (R_CHARGE_OHMS + R_GPIO);
+        float l_current = 1e12f;
+        for(int i=0; i<3; i++) {
+            float l_new = estimateLeakResistance(c_current);
+            if (!isfinite(l_new) || l_new < 1000.0f) l_new = 1e12f;
+            l_current = l_new;
+            c_current = (fr.tau_us * (R_CHARGE_OHMS + R_GPIO + l_current)) / ((R_CHARGE_OHMS + R_GPIO) * l_current);
         }
+        capFit = c_current; leak = l_current;
     }
 
     if (!fr.ok || capFit > 1.0f) {
         capOsc = measureCapOscillator(isfinite(leak) ? leak : 1e12f);
     }
-
     if (isnan(capOsc) || capOsc > 500.0f) {
         capGain = measureCapFeedbackGain(isfinite(leak) ? leak : 1e12f);
     }
 
     float finalCap = 0;
     MeasurementMode mode = MeasurementMode::NONE;
-
     if (isfinite(capFit) && capFit > 0) { finalCap = capFit; mode = MeasurementMode::FIT; }
     if (isfinite(capOsc) && capOsc > 0) {
-        // OSC is generally better for medium caps if it agrees with FIT or if FIT failed
-        bool agreeWithFit = (isfinite(capFit) && capFit > 0.001f && fabsf(capOsc - capFit) / capFit < 0.2f);
-        if (mode == MeasurementMode::NONE || agreeWithFit || capFit > 100.0f) {
+        bool capFitStable = (isfinite(capFit) && capFit > 1e-4f);
+        bool agreeWithFit = capFitStable && (fabsf(capOsc - capFit) / capFit < 0.2f);
+        if (mode == MeasurementMode::NONE || agreeWithFit || (capFitStable && capFit > 100.0f)) {
              finalCap = capOsc; mode = MeasurementMode::OSC;
         }
     }
-    if (isfinite(capGain) && capGain > 0) {
-        if (mode == MeasurementMode::NONE || (isfinite(capOsc) && capOsc > 1000.0f)) {
+    if (isfinite(capGain) && capGain > 0.0f) {
+        bool capOscStable = (isfinite(capOsc) && capOsc > 0.1f);
+        bool agreeWithOsc = capOscStable && (fabsf(capGain - capOsc) / capOsc < 0.3f);
+        if (mode == MeasurementMode::NONE || agreeWithOsc || (capOscStable && capOsc > 1000.0f)) {
             finalCap = capGain; mode = MeasurementMode::GAIN;
         }
     }
@@ -386,10 +377,14 @@ void loop() {
         Serial.print(finalCap, 6); Serial.print(",");
         if (!isfinite(leak) || leak > 1e11) Serial.print("INF"); else Serial.print(leak / 1e6f, 2);
         Serial.print(",");
-        Serial.print(fr.ok ? "OK" : "EST"); Serial.print(",");
-        Serial.print(fr.tau_us); Serial.print(",");
-        Serial.print(fr.vinf); Serial.print(",");
-        Serial.println(fr.ok ? sqrtf(fr.score) : 0.0f, 4);
+        Serial.print(fr.ok ? "OK" : "FIT_FAIL"); Serial.print(",");
+        if (fr.ok) {
+            Serial.print(fr.tau_us); Serial.print(",");
+            Serial.print(fr.vinf); Serial.print(",");
+            Serial.println(sqrtf(fr.score), 4);
+        } else {
+            Serial.println("0,0,0");
+        }
     }
     delay(3000);
 }

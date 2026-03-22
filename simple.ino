@@ -38,8 +38,12 @@ void loop() {
       // Larger capacitor: continue charging to 1 Tau
       double voltage = vCheck;
       while (voltage < targetVoltage) {
-        voltage = (double)analogRead(measurePin) * (supplyVoltage / 4095.0);
+        // Oversampling for stability
+        uint32_t sum = 0;
+        for(int i=0; i<8; i++) sum += analogRead(measurePin);
+        voltage = ((double)sum / 8.0) * (supplyVoltage / 4095.0);
         if (micros() - t0 > 60000000) break;
+        yield();
       }
       unsigned long endTime = micros();
       double chargeTime_s = (double)(endTime - t0) / 1000000.0;
