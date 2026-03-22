@@ -23,24 +23,37 @@ void loop() {
   delay(2000);
   pinMode(dischargePin, INPUT);
 
-  // Continuous charging
+  // Check if capacitor charges too fast
   pinMode(chargePin, OUTPUT);
   digitalWrite(chargePin, HIGH);
-  unsigned long startTime = micros();
+  unsigned long t0 = micros();
+  delayMicroseconds(50);
+  double vCheck = (double)analogRead(measurePin) * (supplyVoltage / 4095.0);
 
-  double voltage = 0;
-  while (voltage < targetVoltage) {
-    voltage = analogRead(measurePin) * (supplyVoltage / 4095.0);
-    if (micros() - startTime > 60000000) break;
+  double calculatedCapacitance;
+  if (vCheck >= 0.1 * supplyVoltage) {
+      calculatedCapacitance = (50.0e-6 / (resistorValue * -log(1.0 - vCheck/supplyVoltage))) * 1000000.0;
+  } else {
+      double voltage = vCheck;
+      while (voltage < targetVoltage) {
+        voltage = (double)analogRead(measurePin) * (supplyVoltage / 4095.0);
+        if (micros() - t0 > 60000000) break;
+      }
+      unsigned long endTime = micros();
+      double chargeTime_s = (double)(endTime - t0) / 1000000.0;
+      calculatedCapacitance = (chargeTime_s / resistorValue) * 1000000.0;
   }
-  unsigned long endTime = micros();
+
+  // Verification: use a secondary measurement (discharge time to 1/e)
+  // Ensure it is fully charged before verifying
+  while (analogRead(measurePin) * (supplyVoltage / 4095.0) < targetVoltage * 1.5) {
+      digitalWrite(chargePin, HIGH);
+      delay(1);
+      if (millis() % 1000 == 0) break;
+  }
   pinMode(chargePin, INPUT);
   digitalWrite(chargePin, LOW);
 
-  double chargeTime_s = (double)(endTime - startTime) / 1000000.0;
-  double calculatedCapacitance = (chargeTime_s / resistorValue) * 1000000.0;
-
-  // Verification: use a secondary measurement (discharge time to 1/e)
   double verifiedCapacitance = finalVerificationTest();
   double errorPercentage = (verifiedCapacitance - calculatedCapacitance) / calculatedCapacitance * 100.0;
 

@@ -23,22 +23,31 @@ void loop() {
   delay(2000);
   pinMode(dischargePin, INPUT);
 
-  // Continuous charging
+  // Check if capacitor charges too fast
   pinMode(chargePin, OUTPUT);
   digitalWrite(chargePin, HIGH);
-  unsigned long startTime = micros();
+  unsigned long t0 = micros();
+  delayMicroseconds(50);
+  double vCheck = (double)analogRead(measurePin) * (supplyVoltage / 4095.0);
 
-  double voltage = 0;
-  while (voltage < targetVoltage) {
-    voltage = analogRead(measurePin) * (supplyVoltage / 4095.0);
-    if (micros() - startTime > 60000000) break;
+  double capacitance_uF;
+  if (vCheck >= 0.1 * supplyVoltage) {
+      // Small capacitor: use 50us data point
+      capacitance_uF = (50.0e-6 / (resistorValue * -log(1.0 - vCheck/supplyVoltage))) * 1000000.0;
+  } else {
+      // Larger capacitor: continue charging to 1 Tau
+      double voltage = vCheck;
+      while (voltage < targetVoltage) {
+        voltage = (double)analogRead(measurePin) * (supplyVoltage / 4095.0);
+        if (micros() - t0 > 60000000) break;
+      }
+      unsigned long endTime = micros();
+      double chargeTime_s = (double)(endTime - t0) / 1000000.0;
+      capacitance_uF = (chargeTime_s / resistorValue) * 1000000.0;
   }
-  unsigned long endTime = micros();
+
   pinMode(chargePin, INPUT);
   digitalWrite(chargePin, LOW);
-
-  double chargeTime_s = (double)(endTime - startTime) / 1000000.0;
-  double capacitance_uF = (chargeTime_s / resistorValue) * 1000000.0;
 
   Serial.println(capacitance_uF, 6);
   delay(5000);
