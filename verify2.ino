@@ -37,8 +37,14 @@ static float readVoltage() {
 }
 
 static void waitMicros(uint32_t target) {
+    uint32_t start = micros();
     while ((int32_t)(micros() - target) < 0) {
-        __asm__ __volatile__("nop");
+        // If wait is long, yield to scheduler
+        if ((target - micros()) > 1000) {
+            yield();
+        } else {
+            __asm__ __volatile__("nop");
+        }
     }
 }
 
@@ -63,7 +69,9 @@ static FitResult fitExponential(const Sample *s, size_t n) {
         if (dt > 0 && (dv/dt) < 0.000002f && s[n-1].v < 0.98f * V_SUPPLY_V) vinf = s[n-1].v;
     }
 
-    if (abs(vinf - v0) < 0.05f) return r;
+    if (fabsf(vinf - v0) < 0.05f) return r;
+
+    const uint32_t tStart = s[0].t_us;
 
     // Weighted Least Squares fitting
     double sumW = 0, sumWX = 0, sumWY = 0, sumWXX = 0, sumWXY = 0;
@@ -75,14 +83,15 @@ static FitResult fitExponential(const Sample *s, size_t n) {
         float frac = (s[i].v - v0) / (vinf - v0);
         if (frac > 0.05f && frac < 0.95f) {
             float y = logf(ratio);
+            float tRel = (float)(s[i].t_us - tStart);
             // Weight: favor early samples for better slope detection near t=0
-            float w = 1.0f / (1.0f + s[i].t_us * 1e-5f);
+            float w = 1.0f / (1.0f + tRel * 1e-5f);
 
             sumW   += w;
-            sumWX  += w * s[i].t_us;
+            sumWX  += w * tRel;
             sumWY  += w * y;
-            sumWXX += w * (double)s[i].t_us * s[i].t_us;
-            sumWXY += w * (double)s[i].t_us * y;
+            sumWXX += w * (double)tRel * tRel;
+            sumWXY += w * (double)tRel * y;
             used++;
         }
     }
@@ -90,7 +99,7 @@ static FitResult fitExponential(const Sample *s, size_t n) {
     if (used < 3) return r;
 
     double delta = sumW * sumWXX - sumWX * sumWX;
-    if (abs(delta) < 1e-12) return r;
+    if (fabs(delta) < 1e-12) return r;
 
     double slope = (sumW * sumWXY - sumWX * sumWY) / delta;
     if (slope >= 0) return r;
@@ -139,6 +148,7 @@ static float measureCapOscillator(float leak) {
     if (vSteady < vH * 1.05f) return NAN;
 
     uint32_t tStart = millis();
+    // Warm-up: get into the oscillation band
     startCharge();
     while(readVoltage() < vL) {
         if (millis() - tStart > 5000) return NAN;
@@ -146,23 +156,35 @@ static float measureCapOscillator(float leak) {
     }
     stopCharge();
 
-    uint32_t tS = micros();
-    for(int i=0; i<10; i++) {
+    // Discard first half-cycle to stabilize
+    startDischarge();
+    while(readVoltage() > vL) {
+        if (millis() - tStart > 7000) return NAN;
+        yield();
+    }
+    stopDischarge();
+
+    uint32_t tAccumUs = 0;
+    const int cycles = 10;
+
+    for(int i=0; i < cycles; i++) {
+        uint32_t t1 = micros();
         startCharge();
         while(readVoltage() < vH) {
-            if (micros() - tS > 10000000) return NAN;
+            if (micros() - t1 > 5000000) return NAN;
             yield();
         }
         stopCharge();
 
         startDischarge();
         while(readVoltage() > vL) {
-            if (micros() - tS > 20000000) return NAN;
+            if (micros() - t1 > 10000000) return NAN;
             yield();
         }
         stopDischarge();
+        tAccumUs += (micros() - t1);
     }
-    float tCycle = (float)(micros() - tS) / 10.0f;
+    float tCycle = (float)tAccumUs / (float)cycles;
     float a = (vSteady - vL) / (vSteady - vH);
     float b = vH / vL;
     if (a <= 0.0f || b <= 0.0f) return NAN;
@@ -236,7 +258,19 @@ void loop() {
     FitResult fr = fitExponential(samples_buf, n);
     if (fr.ok) {
         float leak = measureLeakageFeedback();
+        if (!isfinite(leak) || leak <= 0.0f) {
+            Serial.println("FAIL,0,0,LEAK_INVALID");
+            delay(3000);
+            return;
+        }
+
         float cap = (fr.tau_us * 1e-6f * (R_CHARGE_OHMS + R_GPIO + leak) / ((R_CHARGE_OHMS + R_GPIO) * leak)) * 1e6f;
+        if (!isfinite(cap) || cap <= 0.0f) {
+            Serial.println("FAIL,0,0,CAP_INVALID");
+            delay(3000);
+            return;
+        }
+
         const char* mode = "FIT";
 
         if (cap > 10.0f) {
