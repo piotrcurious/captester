@@ -138,7 +138,9 @@ static FitResult fitExponential(const Sample *s, size_t n, float v0) {
     // Final sanity checks on the model
     if (best.ok) {
         if (best.tau_us < 1.0f || best.tau_us > 100000000.0f) best.ok = false;
-        if (best.score > 0.01f) best.ok = false; // High normalized RSS
+        // score is RSS / used points. RMSE is sqrt(score).
+        // Standardize: fit is questionable if RMSE > 50mV
+        if (sqrtf(best.score) > 0.050f) best.ok = false;
     }
 
     return best;
@@ -173,14 +175,16 @@ static float measureCapOscillator(float leak) {
     float vSteady = V_SUPPLY_V * leak / (R_CHARGE_OHMS + R_GPIO + leak);
     if (vSteady < vH * 1.05f) return NAN;
 
+    // Phase 1: Pre-condition - charge above vL
     uint32_t deadline = millis() + 5000;
     startCharge();
-    while(readVoltage() < vL) {
+    while(readVoltage() < vL * 1.1f) {
         if (millis() > deadline) return NAN;
         yield();
     }
     stopCharge();
 
+    // Phase 2: Establish known state at vL with discharge
     deadline = millis() + 5000;
     startDischarge();
     while(readVoltage() > vL) {
@@ -220,6 +224,7 @@ static float measureCapOscillator(float leak) {
 
 // Method 4: Virtual Feedback Gain (dV/dt)
 static float measureCapFeedbackGain(float leak) {
+    if (!isfinite(leak) || leak < 1000.0f) return NAN;
     float vStart = 1.0f, vEnd = 1.2f;
     uint32_t deadline = millis() + 5000;
     if (readVoltage() > vStart) {
@@ -247,7 +252,9 @@ static float measureCapFeedbackGain(float leak) {
     float dt = (float)(t2 - t1) / 1000000.0f, dv = vEnd - vStart;
     float vAvg = (vStart + vEnd) / 2.0f;
     float i_cap = ((V_SUPPLY_V - vAvg) / (R_CHARGE_OHMS + R_GPIO)) - (vAvg / leak);
-    return (i_cap * dt / dv) * 1e6f;
+    if (i_cap <= 0.0f) return NAN;
+    float cap = (i_cap * dt / dv) * 1e6f;
+    return (cap > 0.0f) ? cap : NAN;
 }
 
 void setup() {
@@ -258,6 +265,17 @@ void setup() {
 #endif
     Serial.println("\n--- Capacitor Parameter Inference System ---");
     Serial.println("mode,cap_uF,leak_MOhm,status");
+}
+
+enum class MeasurementMode { NONE, FIT, OSC, GAIN };
+
+const char* modeToString(MeasurementMode m) {
+    switch(m) {
+        case MeasurementMode::FIT: return "FIT";
+        case MeasurementMode::OSC: return "OSC";
+        case MeasurementMode::GAIN: return "GAIN";
+        default: return "NONE";
+    }
 }
 
 void loop() {
@@ -280,7 +298,7 @@ void loop() {
 
         // Balanced sampling strategy: high density early, sufficient density late
         uint32_t interval = baseInterval + (uint32_t)(n * 0.5f * (float)baseInterval);
-        if (n > 200) interval += (uint32_t)((n - 200) * 2.0f * (float)baseInterval);
+        if (n > 200) interval += (uint32_t)((n - 200) * 5.0f * (float)baseInterval);
 
         uint32_t target = micros() + interval;
         waitMicros(target);
@@ -310,25 +328,25 @@ void loop() {
     }
 
     float finalCap = 0;
-    const char* mode = "NONE";
+    MeasurementMode mode = MeasurementMode::NONE;
 
-    if (isfinite(capFit) && capFit > 0) { finalCap = capFit; mode = "FIT"; }
+    if (isfinite(capFit) && capFit > 0) { finalCap = capFit; mode = MeasurementMode::FIT; }
     if (isfinite(capOsc) && capOsc > 0) {
         // OSC is generally better for medium caps if it agrees with FIT or if FIT failed
-        if (mode == "NONE" || fabsf(capOsc - capFit)/capFit < 0.2f || capFit > 100.0f) {
-             finalCap = capOsc; mode = "OSC";
+        if (mode == MeasurementMode::NONE || fabsf(capOsc - capFit)/capFit < 0.2f || capFit > 100.0f) {
+             finalCap = capOsc; mode = MeasurementMode::OSC;
         }
     }
     if (isfinite(capGain) && capGain > 0) {
-        if (mode == "NONE" || (isfinite(capOsc) && capOsc > 1000.0f)) {
-            finalCap = capGain; mode = "GAIN";
+        if (mode == MeasurementMode::NONE || (isfinite(capOsc) && capOsc > 1000.0f)) {
+            finalCap = capGain; mode = MeasurementMode::GAIN;
         }
     }
 
-    if (mode == "NONE") {
+    if (mode == MeasurementMode::NONE) {
         Serial.println("FAIL,0,0,NO_ESTIMATE");
     } else {
-        Serial.print(mode); Serial.print(",");
+        Serial.print(modeToString(mode)); Serial.print(",");
         Serial.print(finalCap, 6); Serial.print(",");
         if (!isfinite(leak) || leak > 1e11) Serial.print("INF"); else Serial.print(leak / 1e6f, 2);
         Serial.print(",OK,");
