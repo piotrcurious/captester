@@ -41,7 +41,7 @@ void loop() {
   double calculatedCapacitance = (chargeTime_s / resistorValue) * 1000000.0;
 
   // Verification: use a secondary measurement (discharge time to 1/e)
-  double verifiedCapacitance = finalVerificationTest(calculatedCapacitance);
+  double verifiedCapacitance = finalVerificationTest();
   double errorPercentage = (verifiedCapacitance - calculatedCapacitance) / calculatedCapacitance * 100.0;
 
   Serial.print("N/A,");
@@ -52,7 +52,7 @@ void loop() {
   delay(5000);
 }
 
-double finalVerificationTest(double lastMeasured_uF) {
+double finalVerificationTest() {
   const double startV = analogRead(measurePin) * (supplyVoltage / 4095.0);
   const double thresholdV = startV / exp(1.0);
 
